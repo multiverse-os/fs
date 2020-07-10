@@ -73,6 +73,10 @@ func (self Directory) File(filename string) (File, error) {
 	}
 }
 
+func (self Directory) List() []Path {
+
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 func (self File) Directory() (Directory, error) {
 	if self.Path().IsDirectory() {
@@ -345,7 +349,55 @@ func (self File) Open() *os.File {
 	return openedFile
 }
 
+func (self File) ReadOnly() *os.File {
+	if !self.Path().Exists() {
+		self = self.Create()
+	}
+	openedFile, err := os.OpenFile(self.String(), os.O_RDONLY, 0640|os.ModeSticky)
+	if err != nil {
+		panic(err)
+	}
+	return openedFile
+}
+
+func (self File) WriteOnly() *os.File {
+	if !self.Path().Exists() {
+		self = self.Create()
+	}
+	openedFile, err := os.OpenFile(self.String(), os.O_WRONLY|os.O_APPEND, 0640|os.ModeSticky)
+	if err != nil {
+		panic(err)
+	}
+	return openedFile
+}
+
+func (self File) ReadWrite() *os.File {
+	if !self.Path().Exists() {
+		self = self.Create()
+	}
+	openedFile, err := os.OpenFile(self.String(), os.O_RDWR|os.O_APPEND, 0640|os.ModeSticky)
+	if err != nil {
+		panic(err)
+	}
+	return openedFile
+}
+
+func (self File) Sync() *os.File {
+	if !self.Path().Exists() {
+		self = self.Create()
+	}
+	openedFile, err := os.OpenFile(self.String(), os.O_SYNC|os.O_APPEND, 0640|os.ModeSticky)
+	if err != nil {
+		panic(err)
+	}
+	return openedFile
+}
+
 // IO: Reads //////////////////////////////////////////////////////////////////
+
+// TODO: Would like the ability to read lines, last 20, first 20, or specific
+// line. Then we can do specific line edits with this library, patches, diffs,
+// etc.
 
 // NOTE: Simply read ALL bytes
 func (self File) Bytes() (output []byte) {
@@ -361,25 +413,27 @@ func (self File) Bytes() (output []byte) {
 	return output
 }
 
+func (self File) String() string { return string(self.Bytes()) }
+
 // NOTE: This is essentially a Head as is
-func (self File) HeadBytes(limitSize int) ([]byte, error) {
+func (self File) HeadBytes(readSize int) ([]byte, error) {
 	var limitBytes []byte
 	file := self.Open()
-	readBytes, err := io.ReadAtLeast(file, limitBytes, limitSize)
-	if readBytes != limitSize {
-		return limitBytes, fmt.Errorf("error: failed to complete read: read ", readBytes, " out of ", limitSize, "bytes")
+	readBytes, err := io.ReadAtLeast(file, limitBytes, readSize)
+	if readBytes != readSize {
+		return limitBytes, fmt.Errorf("error: failed to complete read: read ", readBytes, " out of ", readSize, "bytes")
 	} else {
 		return limitBytes, err
 	}
 }
 
 // NOTE: This is essentially a Head as is
-func (self File) TailBytes(readLimit int) ([]byte, error) {
+func (self File) TailBytes(readSize int) ([]byte, error) {
 	var data []byte
 	file := self.Open()
-	bytesRead, err := io.ReadAtLeast(file, data, readLimit)
-	if bytesRead != readLimit {
-		return data, fmt.Errorf("error: failed to complete read: read ", bytesRead, " out of ", readLimit, "bytes")
+	bytesRead, err := io.ReadAtLeast(file, data, readSize)
+	if bytesRead != readSize {
+		return data, fmt.Errorf("error: failed to complete read: read ", bytesRead, " out of ", readSize, "bytes")
 	} else {
 		return data, err
 	}
@@ -394,10 +448,19 @@ const (
 	Parallel // Async? -
 )
 
+type ChunkSize int
+
+const (
+	SmallChunk  ChunkSize = 256
+	MediumChunk ChunkSize = 512
+	LargeChunk  ChunkSize = 1024
+)
+
 type Read struct {
 	Type   ReadType
 	ReadAt time.Time
 	File   File
+	Chunk  int
 	Offset int
 	Limit  int
 }
@@ -418,17 +481,20 @@ type Read struct {
 //     File("/thing/dot.yaml").Read().Byes
 
 // NOTE: This is essentially a Head as is
-func (self File) Read(readType ReadType) *Read {
+func (self File) read(readType ReadType) *Read {
 	return &Read{
 		Type:   readType,
 		File:   self,
 		Offset: 0,
+		Chunk:  SmallChunk,
 		Limit:  self.Path().Size(),
 	}
 }
 
-func (self File) ParallelRead() *Read { return Read(Parallel) }
-func (self File) LockAndRead() *Read  { return Read(Lock) }
+func (self File) Read() *Read { return read(NoLock) }
+
+func (self File) ParallelRead() *Read { return read(Parallel) }
+func (self File) LockAndRead() *Read  { return read(Lock) }
 
 func (self *Read) Path() Path {
 	return self.File.Path()
@@ -444,15 +510,65 @@ func (self *Read) Limit(limit int) *Read {
 	return self
 }
 
+func (self *Read) Chunk(chunk int) *Read {
+	self.Chunk = chunk
+	return self
+}
+
+func (self *Read) Chunks() int {
+	chunks := (self.File.Size() / self.Chunk)
+	if (self.File.Size() % self.Chunk) != 0 {
+		return (chunks + 1)
+	} else {
+		return chunks
+	}
+}
+
+func (self *Read) ChunkOffset(chunkIndex int) int {
+	return (self.Chunk * chunkIndex)
+}
+
+func (self *Read) ReadSection(chunkIndex int) []byte {
+	var data []byte
+
+	offsetFile, err := self.File.ReadOnly().Seek(self.ChunkOffset(chunkIndex), 0)
+	if err != nil {
+		panic(err)
+	}
+	bytesRead, err = io.ReadAtLeast(offsetFile, data, self.Cunk)
+	if self.Chunks != chunkIndex && bytesRead != self.Chunk {
+		panic(fmt.Errorf("error: failed to reach entire chunk. read: ", bytesRead, " out of ", self.Chunk))
+	}
+	if err != nil {
+		panic(err)
+	}
+	return data
+}
+
 func (self *Read) Bytes() []byte {
 	var data []byte
-	bytesRead, err := io.ReadAtLeast(self.File.String(), data, self.Limit)
-	if bytesRead != self.Limit {
+	var readBytes int
+	var err error
+
+	switch self.Type {
+	case Parallel:
+		// TODO: Currently does not attempt a parellel read
+		readBytes, err = io.ReadAtLeast(self.File.Open(), data, self.Limit)
+	case Lock:
+		// TODO: Does not currenly preform lock
+		readBytes, err = io.ReadAtLeast(self.File.Open(), data, self.Limit)
+	default: // NoLock:
+		readBytes, err = io.ReadAtLeast(self.File.Open(), data, self.Limit)
+	}
+
+	if readBytes != self.Limit {
 		return data, fmt.Errorf("error: failed to complete read: read ", readBytes, " out of ", self.Limit, "bytes")
 	} else {
 		return data, err
 	}
 }
+
+func (self *Read) String() string { return string(self.Bytes()) }
 
 // TODO:
 // If over x size, split into chunks of X, then do section reads, then use
