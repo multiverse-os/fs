@@ -8,9 +8,29 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
+
+// TASKS
+///////////////////////////////////////////////////////////////////////////////
+
+// * File locking for reading and writing for atomicity
+// Reference:
+//
+//   https://github.com/golang/go/blob/master/src/cmd/go/internal/lockedfile/mutex.go
+//
+
+// * Add ability to have error checking raptor/reed-solomon etc read/writes
+
+// * zero-copy or something
+
+// * Missing links, symlinks etc
+
+// * Make a type that is a smart truncate for logs. It will chop off the first
+// portion, leaving the remainder and then append to that amount. at a set
+// amount of like 1 MB of data.
 
 ////////////////////////////////////////////////////////////////////////////////
 // NOTE
@@ -38,7 +58,17 @@ type Path string
 type Directory Path
 type File Path
 
+type Hash string
+type Line string
+
+const (
+	LineBreak = "\n"
+	Return    = "\r"
+)
+
 // TODO: Chown, Chmod, SoftLink, HardLink, Stream Write, Stream Read, Zero-Copy
+
+func ParsePath(path string) Path { return Path(path).Clean() }
 
 func (self Path) String() string { return string(self) }
 
@@ -73,8 +103,33 @@ func (self Directory) File(filename string) (File, error) {
 	}
 }
 
-func (self Directory) List() []Path {
+func (self Directory) List() (list []Path) {
+	files, err := ioutil.ReadDir(self.Path().String())
+	if err != nil {
+		panic(err)
+	}
+	for _, fileInfo := range files {
+		list = append(list, Path(filepath.Join(self.String(), fileInfo.Name())))
+	}
+	return list
+}
 
+func (self Directory) Subdirectories() (list []Directory) {
+	for _, file := range self.List() {
+		if file.IsDirectory() {
+			list = append(list, Directory(file))
+		}
+	}
+	return list
+}
+
+func (self Directory) Subfiles() (list []File) {
+	for _, file := range self.List() {
+		if file.IsFile() {
+			list = append(list, File(file))
+		}
+	}
+	return list
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -94,7 +149,6 @@ func (self File) BaseDirectory() Directory {
 	}
 }
 
-func (self File) String() string   { return string(self) }
 func (self File) Path() Path       { return Path(self) }
 func (self File) Name() string     { return filepath.Base(Path(self).String()) }
 func (self File) Basename() string { return self.Name()[0:(len(self.Name()) - len(self.Extension()))] }
@@ -125,18 +179,6 @@ func (self Path) Rename(path string) error {
 func (self Path) Remove() error { return os.RemoveAll(self.String()) }
 
 // INFO / META ////////////////////////////////////////////////////////////////
-//type OwnershipType bool
-//
-//const (
-//	User OwnershipType = iota
-//	Group
-//)
-
-//type FileDescriptor struct {
-//	Pointer *uinptr
-//	*os.File
-//}
-
 // NOTE: Lets always clean before we get to these so no error is possible.
 func (self Path) Metadata() os.FileInfo {
 	info, err := os.Stat(self.String())
@@ -148,14 +190,17 @@ func (self Path) Metadata() os.FileInfo {
 
 // TODO: For folders we shuld calculate the size of all the contents recursively
 // eventually but for now we just need the file size.
-func (self Path) Size() int {
-	return int(self.Metadata().Size())
+func (self Path) Size() int64 {
+	return self.Metadata().Size()
 }
 
-//func (self Path) FileDescriptor() {}
-
-//func (self Path) Owner() User, Group {}
-//func (self Path) OwnerIDs() UID, GUID {}
+func (self Path) UID() int {
+	if stat, ok := self.Metadata().Sys().(*syscall.Stat_t); ok {
+		return int(stat.Uid)
+	} else {
+		panic(fmt.Errorf("error: failed to obtain uid of: ", self.String()))
+	}
+}
 
 func (self Path) GUID() int {
 	if stat, ok := self.Metadata().Sys().(*syscall.Stat_t); ok {
@@ -165,76 +210,11 @@ func (self Path) GUID() int {
 	}
 }
 
-//func (self Path) UID() int {
-//	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-//		return int(stat.Uid)
-//	} else {
-//		panic(fmt.Errorf("error: failed to obtain uid of: ", self.String()))
-//	}
-//}
-
-// Perm returns the Unix permission bits in m.
-//func (m FileMode) Perm() FileMode {
-//	return m & ModePerm
-//}
 func (self Path) Permissions() os.FileMode {
 	return self.Metadata().Mode()
 }
 
 // IO /////////////////////////////////////////////////////////////////////////
-// File is the real representation of *File.
-// The extra level of indirection ensures that no clients of os
-// can overwrite this data, which could cause the finalizer
-// to close the wrong file descriptor.
-// type file struct {
-// 	pfd         poll.FD
-// 	name        string
-// 	dirinfo     *dirInfo // nil unless directory being read
-// 	nonblock    bool     // whether we set nonblocking mode
-// 	stdoutOrErr bool     // whether this is stdout or stderr
-// 	appendMode  bool     // whether file is opened for appending
-// }
-
-// NOTE: This very important; unlike the stdlibrary, the create action is
-// entirely segregated from read, write and sync. This is simply a create action
-// only. If it does not exist, it creates it, with the option of overwriting it,
-// or append (which since we are segregating read/write/sync is non-action.
-
-// ORIGINAL STDLIB CREATE DOES
-// Create creates or truncates the named file. If the file already exists, it
-// is truncated. If the file does not exist, it is created with mode 0666
-// (before umask). If successful, methods on the returned File can be used for
-// I/O; the associated file descriptor has mode O_RDWR. If there is an error,
-// it will be of type *PathError.
-
-// WHATS DIFFERENT
-// (1) All paths are validated/cleaned so there is a single choke-point of
-// PathError's, meaning there is no error return; all functions only return the
-// single value, making them easier to chain together, and keeping error
-// handling to a single part of the software.
-// (2) No value is returned from create; instead an immediate close is called.
-// nothing is held in memory, and no locks are held. Instead path information,
-// about the file is passed around, so a fine-grained READONLY, WRITEONLY, SYNC
-// style IO can be called specifically, with a time limit, on a speicifc segment
-// of the file and immediately closed. Overwrite() will create a file if it
-// doesn't exist, and overwrite any existing files; and Create(false) will
-// create a file if it does not exist, but not overwrite an existing file.
-
-// This gives the the following API
-// 		File("some/path/to/file.yaml").Create().Read()
-//    File("some/file.yaml").Overwrite().Write("test")
-//
-// Closes happen automatically, everything is streaming, zero-copy. We are not
-// passing around a *os.File, we are passing around a `type Path string` of the
-// location.
-
-// **And perhaps we should be just passing around the FD pointer,
-// since that would be a uint and not a string, therefore faster lookups?**
-
-// **Still need to handle NewFile(fd) functionaliy**
-// NOTE: All panic(err) are temporary just for debugging, while we push all errors
-// to the choke-point of validation and cleaning.
-
 func (self Path) Create() {
 	switch {
 	case self.IsDirectory():
@@ -331,9 +311,13 @@ func (self File) Owner(username string) File {
 }
 
 func (self File) Group(guid int) File {
+	// TODO: Like above, should be checking the group exists
+	os.Chown(self.String(), self.Path().UID(), guid)
 	return self
 }
 func (self File) Chown(uid, guid int) File {
+	// TODO: Like above, should be checking the group exists
+	os.Chown(self.String(), uid, guid)
 	return self
 }
 
@@ -393,6 +377,10 @@ func (self File) Sync() *os.File {
 	return openedFile
 }
 
+func (self File) Fd() uintptr {
+	return self.ReadOnly().Fd()
+}
+
 // IO: Reads //////////////////////////////////////////////////////////////////
 
 // TODO: Would like the ability to read lines, last 20, first 20, or specific
@@ -419,6 +407,10 @@ func (self File) String() string { return string(self.Bytes()) }
 func (self File) HeadBytes(readSize int) ([]byte, error) {
 	var limitBytes []byte
 	file := self.Open()
+
+	// TODO: Use seek, seek is really powerful, it lets you jump forward back,
+	// etc.
+
 	readBytes, err := io.ReadAtLeast(file, limitBytes, readSize)
 	if readBytes != readSize {
 		return limitBytes, fmt.Errorf("error: failed to complete read: read ", readBytes, " out of ", readSize, "bytes")
@@ -439,83 +431,260 @@ func (self File) TailBytes(readSize int) ([]byte, error) {
 	}
 }
 
-type ReadType int
-
-// PARALLEL like break up into x parts and do sector reads and use multireader to combine the resulting streaIm
-const (
-	NoLock ReadType = iota
-	Lock
-	Parallel // Async? -
-)
-
-type ChunkSize int
-
-const (
-	SmallChunk  ChunkSize = 256
-	MediumChunk ChunkSize = 512
-	LargeChunk  ChunkSize = 1024
-)
-
-type Read struct {
-	Type   ReadType
-	ReadAt time.Time
-	File   File
-	Chunk  int
-	Offset int
-	Limit  int
+// LINES //////////////////////////////////////////////////////////////////////
+// TODO: Add all the code needed for easily abstracting patching, diffs, and
+// similar functionality using this library as the backend.
+func (self File) Lines() []Line {
+	var lines []Line
+	for _, line := range strings.Split(self.String(), LineBreak) {
+		lines = append(lines, Line(line))
+	}
+	return lines
 }
 
-// API will be:
-//
-//  By default Read() will set the offset to 0, and the size to the entire file.
-//  we always want to stream even if we are providing the data.
-//
-//  File("test.yml").Read().Offset(5).Length(25).Bytes()
-// and maybe we do Read(Parallel) ->  (or Async)
-// use sectional reading + multireader to reassmble
-//                 Read(Lock) ->
-//                   lock with a file based atomic lock, or os based
-//                Read(NoLock) ->
-//
+func (self File) HeadLines(lineCount int) []Line {
+	var lines []Line
+	for index, line := range strings.Split(self.String(), LineBreak) {
+		if index == (lineCount - 1) {
+			break
+		}
+		lines = append(lines, Line(line))
+	}
+	return lines
+}
 
-//     File("/thing/dot.yaml").Read().Byes
+func (self File) TailLines(lineCount int) []Line {
+	var lines []Line
+	fileLines := strings.Split(self.String(), LineBreak)
+	for index := len(fileLines) - 1; index >= 0; index-- {
+		if index == (lineCount - 1) {
+			break
+		}
+		lines = append(lines, Line(fileLines[index]))
+	}
+	return lines
+}
 
-// NOTE: This is essentially a Head as is
-func (self File) read(readType ReadType) *Read {
-	return &Read{
-		Type:   readType,
+func (self File) Head() []Line { return self.HeadLines(20) }
+func (self File) Tail() []Line { return self.TailLines(20) }
+
+///////////////////////////////////////////////////////////////////////////////
+type OpenType int
+
+const (
+	Append OpenType = iota
+	Overwrite
+)
+
+// TODO: This is actually quite important, we need to build this so that later
+// we will be able to support variable chunk sizes. This is important for later
+// streaming protocol plans.
+
+// NOTE: This is a really good concept actually, and building abstraction around
+// this like locking subtrees, writing subtrees, etc, would make a fantastic
+// foundation for a RESP3 implementation for example; however we need to move
+// forward. So we will just make a note about this structure and come back to it
+// later
+// TODO: My ideal chunking model would actually be a tree.
+//       It would reflect a merkle tree, and any subtree could be grabbed using
+//       the hash for that subtree. And it would return the offset and length,
+//       and ability to read those bytes.
+
+type Chunk struct {
+	//Parent        *Chunk
+	//ChildChunks   []*Chunk
+	//NeighborChunk *Chunk
+	Index  int
+	Offset int64
+	Length int64
+	//Checksum Hash
+}
+
+// NOTE After a lot of experimentation it just made sense to by default work
+// within the chunking design pattern. Even when its not being used, just have
+// that condition be  achunk that is the offset 0, length -1, and a single
+// chunk.
+type Read struct {
+	File     File
+	Atomic   bool // Use Locks
+	Length   int64
+	ReadAt   time.Time
+	Chunks   []Chunk
+	Checksum Hash // Root of Merkle
+}
+
+func (self File) Read() *Read {
+	read := &Read{
 		File:   self,
-		Offset: 0,
-		Chunk:  SmallChunk,
-		Limit:  self.Path().Size(),
+		Length: self.Path().Size(),
+		ReadAt: time.Now(),
+		Chunks: []Chunk{
+			Chunk{
+				Offset: 0,
+				Length: self.Path().Size(),
+			},
+		},
+	}
+
+}
+
+func (self *Read) ChunkedRead(size int64) *Read {
+	chunks := fileSize / int64(size)
+	if (fileSize % chunkSize) != 0 {
+		chunks += 1
 	}
 }
 
-func (self File) Read() *Read { return read(NoLock) }
-
-func (self File) ParallelRead() *Read { return read(Parallel) }
-func (self File) LockAndRead() *Read  { return read(Lock) }
-
-func (self *Read) Path() Path {
-	return self.File.Path()
+func (self File) ParallelRead(chunks int64) *Read {
+	fileSize := self.Path().Size()
+	chunkSize := fileSize / chunks
+	if (fileSize % chunks) != 0 {
+		chunkSize += 1
+	}
+	return &Read{
+		Type:   Async,
+		File:   self,
+		Atomic: true,
+		Length: fileSize,
+		//ChunkSize:  chunkSize,
+		//ChunkCount: chunks,
+	}
 }
 
-func (self *Read) Offset(offset int) *Read {
-	self.Offset = offset
+func (self *Read) FullRead() *Read {
+
+}
+
+func (self *Read) Path() Path { return self.File.Path() }
+
+func (self *Read) StartAt(offset int) *Read {
+	self.Offset = int64(offset)
+	return self
+}
+
+// Aliasing
+func (self *Read) Skip(offset int) *Read { return self.StartAt(offset) }
+
+func (self *Read) UseLock() *Read {
+	self.Lock = true
 	return self
 }
 
 func (self *Read) Limit(limit int) *Read {
-	self.Limit = limit
+	self.Length = int64(limit)
 	return self
 }
 
-func (self *Read) Chunk(chunk int) *Read {
-	self.Chunk = chunk
+func (self *Read) Chunk(size int) *Read {
+	self.ChunkSize = int64(size)
 	return self
 }
 
-func (self *Read) Chunks() int {
+func (self *Read) ChunkCount() uint64 {
+	chunks := (self.File.Path().Size() / self.Chunk)
+	if (self.File.Path().Size() % self.Chunk) != 0 {
+		return uint64(chunks + 1)
+	} else {
+		return uint64(chunks)
+	}
+}
+
+func (self *Read) InitiailizeChunks() []*Read {
+	for i := 0; i < self.ChunkCount(); i++ {
+		self.Chunks = append(self.Chunks, &Read{
+			File:   self.File,
+			Offset: (i * self.ChunkSize),
+		})
+	}
+}
+
+func (self *Read) ChunkOffset(chunkIndex int) int64 {
+	return int64(chunkIndex) * self.Chunk
+}
+
+func (self *Read) ReadSection() io.Reader {
+	return io.NewSectionReader(self.File.ReadOnly(), self.Offset, self.Length)
+}
+
+func (self *Read) ReadChunk(chunkIndex int) io.Reader {
+	return io.NewSectionReader(self.File.ReadOnly(), self.ChunkOffset(chunkIndex), self.Chunk)
+}
+
+func (self *Read) Bytes() []byte {
+	switch self.Type {
+	case Parallel:
+		// TODO: Currently does not attempt a parellel read
+
+	default:
+		return self.File.Bytes()
+	}
+	if err != nil {
+		panic(err)
+	}
+	if readBytes != self.Limit {
+		panic(fmt.Errorf("error: failed to complete read: read ", readBytes, " out of ", self.Limit, "bytes"))
+	}
+	return data
+}
+
+func (self *Read) String() string { return string(self.Bytes()) }
+
+// WRITE //////////////////////////////////////////////////////////////////////
+type Write struct {
+	Type    IOType
+	WriteAt time.Time
+	File    File
+	Chunk   int64
+	Offset  int64
+	Length  int64
+}
+
+func (self File) Write(writeType WriteType) *Write {
+	return &Write{
+		Type:   writeType,
+		File:   self,
+		Offset: 0,
+	}
+}
+
+func (self *Write) Offset(offset int) *Write {
+	self.Offset = offset
+	return self
+}
+
+func (self *Write) Bytes(b []byte) error {
+	file := self.File.WriteOnly()
+	bytesToWrite := len(b)
+	return ioutil.WriteFile(self.File.Path().String(), b, 0644)
+}
+
+func (self *Write) String(s string) error {
+	file := self.File.WriteOnly()
+	bytesToWrite := len([]byte(s))
+	bytesWritten, err := file.WriteString(s)
+	if err != nil {
+		return err
+	}
+	if bytesWritten != bytesToWrite {
+		return fmt.Errorf("error: failed write all bytes: ", bytesWritten, " out of ", bytesToWrite)
+	}
+	return file.Close()
+}
+
+// FILE LOCKING ///////////////////////////////////////////////////////////////
+// Trying to keep it as simple as possible, but supporting similar functionlaity
+// and having similar API to Read/Write IO
+
+type Lock struct {
+	Path    Path
+	Timeout time.Duration
+	Type    int
+	Offset  int64
+	Length  int64
+	Chunk   int64
+}
+
+func (self *Lock) Chunks() int {
 	chunks := (self.File.Size() / self.Chunk)
 	if (self.File.Size() % self.Chunk) != 0 {
 		return (chunks + 1)
@@ -524,74 +693,74 @@ func (self *Read) Chunks() int {
 	}
 }
 
-func (self *Read) ChunkOffset(chunkIndex int) int {
+func (self *Lock) ChunkOffset(chunkIndex int) int {
 	return (self.Chunk * chunkIndex)
 }
 
-func (self *Read) ReadSection(chunkIndex int) []byte {
-	var data []byte
-
-	offsetFile, err := self.File.ReadOnly().Seek(self.ChunkOffset(chunkIndex), 0)
-	if err != nil {
-		panic(err)
-	}
-	bytesRead, err = io.ReadAtLeast(offsetFile, data, self.Cunk)
-	if self.Chunks != chunkIndex && bytesRead != self.Chunk {
-		panic(fmt.Errorf("error: failed to reach entire chunk. read: ", bytesRead, " out of ", self.Chunk))
-	}
-	if err != nil {
-		panic(err)
-	}
-	return data
-}
-
-func (self *Read) Bytes() []byte {
-	var data []byte
-	var readBytes int
-	var err error
-
-	switch self.Type {
-	case Parallel:
-		// TODO: Currently does not attempt a parellel read
-		readBytes, err = io.ReadAtLeast(self.File.Open(), data, self.Limit)
-	case Lock:
-		// TODO: Does not currenly preform lock
-		readBytes, err = io.ReadAtLeast(self.File.Open(), data, self.Limit)
-	default: // NoLock:
-		readBytes, err = io.ReadAtLeast(self.File.Open(), data, self.Limit)
-	}
-
-	if readBytes != self.Limit {
-		return data, fmt.Errorf("error: failed to complete read: read ", readBytes, " out of ", self.Limit, "bytes")
-	} else {
-		return data, err
+func (self File) WriteLock(lockType LockType) *Lock {
+	return &Lock{
+		Type:    syscall.F_WRLCK,
+		Path:    self.Path(),
+		Timeout: (12 * time.Second),
+		Offset:  0,
+		Length:  self.Size(),
 	}
 }
 
-func (self *Read) String() string { return string(self.Bytes()) }
+func (self File) ReadLock(lockType LockType) *Lock {
+	return &Lock{
+		Type:    syscall.F_RDLCK,
+		Path:    self.Path(),
+		Timeout: (12 * time.Second),
+		Offset:  0,
+		Length:  self.Size(),
+	}
+}
 
-// TODO:
-// If over x size, split into chunks of X, then do section reads, then use
-// multireader to cocnat all those for parallellism that doesn't fuck itself.
+func (self *Lock) StartAt(offset int) *Lock {
+	self.Offset = offset
+	return self
+}
 
-// Defining readers using NewReader method
-//reader1 := strings.NewReader("104\n")
-//reader2 := strings.NewReader("33.3\n")
-//reader3 := strings.NewReader("703243242\n")
+func (self *Lock) Skip(offset int) *Lock {
+	return self.StartAt(offset)
+}
 
-//// Calling MultiReader method with its parameters
-//r := io.MultiReader(reader1, reader2, reader3)
+func (self *Lock) Limit(limit int) *Lock {
+	self.Length = limit
+	return self
+}
 
-// TODO: End with Read? Meaning our API is:
-//  File("thing.yml").Limit(20).Offset(14).Read() => []byte
-//
-// And open only happens on the read, auto-closes, and does read-only open, and
-// can even lock, with a Lock() fucntion most likely.
+func (self *Lock) ChunkSize(size int) *Lock {
+	self.Chunk = size
+	return self
+}
 
-//
-// func (self File) Read() []byte  {}
+func (self *Lock) Close() error {
+	err := syscall.FcntlFlock(self.File.Fd(), syscall.F_SETLK, syscall.Flock_t{
+		Type:   self.Type,
+		Whence: int16(os.SEEK_SET),
+		Start:  self.Offset,
+		Len:    self.Length,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return self.File.Close()
+}
 
-// Need stream and zerocopy
+func (self *Lock) Open() error {
+	err := syscall.FcntlFlock(self.File.Fd(), syscall.F_SETLK, syscall.Flock_t{
+		Type:   syscall.F_UNLCK,
+		Whence: int16(os.SEEK_SET),
+		Start:  self.Offset,
+		Len:    self.Length,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return self.File.Close()
+}
 
 // Validation /////////////////////////////////////////////////////////////////
 func (self Path) Clean() Path {
@@ -604,7 +773,7 @@ func (self Path) Clean() Path {
 	}
 }
 
-// Checking ///////////////////////////////////////////////////////////////////
+// TYPE CHECKS ////////////////////////////////////////////////////////////////
 func (self Path) Exists() bool {
 	_, err := os.Stat(self.String())
 	return !os.IsNotExist(err)
