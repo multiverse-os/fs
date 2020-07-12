@@ -377,9 +377,10 @@ func (self File) Sync() *os.File {
 	return openedFile
 }
 
-func (self File) Fd() uintptr {
-	return self.ReadOnly().Fd()
-}
+func (self File) Fd() uintptr { return self.ReadOnly().Fd() }
+
+// TODO: In the future; pass in Byte, Kilobyte, Megabyte, etc
+func (self File) Size() int64 { return self.Path().Size() }
 
 // IO: Reads //////////////////////////////////////////////////////////////////
 
@@ -505,49 +506,53 @@ type Chunk struct {
 // that condition be  achunk that is the offset 0, length -1, and a single
 // chunk.
 type Read struct {
-	File     File
-	Atomic   bool // Use Locks
-	Length   int64
-	ReadAt   time.Time
-	Chunks   []Chunk
-	Checksum Hash // Root of Merkle
+	File   File
+	Atomic bool // Use Locks
+	ReadAt time.Time
+	Chunks []Chunk
+	//Checksum Hash // Root of Merkle
 }
 
 func (self File) Read() *Read {
-	read := &Read{
+	return &Read{
 		File:   self,
-		Length: self.Path().Size(),
+		Atomic: true,
 		ReadAt: time.Now(),
 		Chunks: []Chunk{
 			Chunk{
 				Offset: 0,
-				Length: self.Path().Size(),
+				Length: self.Size(),
 			},
 		},
 	}
-
 }
 
-func (self *Read) ChunkedRead(size int64) *Read {
-	chunks := fileSize / int64(size)
+func (self *File) Chunk() *Read {
+	for i := 0; i < self.ChunkCount(); i++ {
+		self.Chunks = append(self.Chunks, &Read{
+			File:   self.File,
+			Offset: (i * self.ChunkSize),
+		})
+	}
+}
+
+func (self *Read) Chunked(size int64) *Read {
+	chunks := self.Size() / size
 	if (fileSize % chunkSize) != 0 {
 		chunks += 1
 	}
 }
 
 func (self File) ParallelRead(chunks int64) *Read {
-	fileSize := self.Path().Size()
+	fileSize := self.Size()
 	chunkSize := fileSize / chunks
 	if (fileSize % chunks) != 0 {
 		chunkSize += 1
 	}
+
 	return &Read{
-		Type:   Async,
 		File:   self,
 		Atomic: true,
-		Length: fileSize,
-		//ChunkSize:  chunkSize,
-		//ChunkCount: chunks,
 	}
 }
 
@@ -581,20 +586,11 @@ func (self *Read) Chunk(size int) *Read {
 }
 
 func (self *Read) ChunkCount() uint64 {
-	chunks := (self.File.Path().Size() / self.Chunk)
+	chunks := (self.File.Size() / self.Chunk)
 	if (self.File.Path().Size() % self.Chunk) != 0 {
 		return uint64(chunks + 1)
 	} else {
 		return uint64(chunks)
-	}
-}
-
-func (self *Read) InitiailizeChunks() []*Read {
-	for i := 0; i < self.ChunkCount(); i++ {
-		self.Chunks = append(self.Chunks, &Read{
-			File:   self.File,
-			Offset: (i * self.ChunkSize),
-		})
 	}
 }
 
