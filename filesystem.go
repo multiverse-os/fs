@@ -162,11 +162,11 @@ func (self File) Extension() string { return filepath.Ext(Path(self).String()) }
 // NOTE: Create directories if they don't exist, or simply create the
 // directory, so we can have a single create for either file or directory.
 func (self Path) Move(path string) error {
-	if info, err := os.Stat(path); err != nil {
-		return err
-	} else {
-		self.Create()
+	if self.Exists() {
+		Path(path).Create()
 		return self.Remove()
+	} else {
+		return fmt.Errorf("error: file does not exist")
 	}
 }
 
@@ -294,16 +294,18 @@ func (self File) Owner(username string) File {
 	u, err := user.Lookup(username)
 	var uid int
 	if u != nil {
-		uid := u.Uid
+		uid, err = strconv.Atoi(u.Uid)
+		if err != nil {
+			panic(err)
+		}
 	} else if err != nil {
 		user, idError := user.LookupId(username)
 		if idError != nil {
 			panic(err)
-		} else {
-			uid, err = strconv.Atoi(u.Uid)
-			if err != nil {
-				panic(err)
-			}
+		}
+		uid, err = strconv.Atoi(user.Uid)
+		if err != nil {
+			panic(err)
 		}
 	}
 	os.Chown(self.String(), uid, self.Path().GUID())
@@ -398,8 +400,10 @@ func (self File) Bytes() (output []byte) {
 			// chokepoint.
 			panic(err)
 		}
+		return output
+	} else {
+		panic(fmt.Errorf("error: no file exists"))
 	}
-	return output
 }
 
 func (self File) String() string { return string(self.Bytes()) }
@@ -495,6 +499,7 @@ type Chunk struct {
 	//Parent        *Chunk
 	//ChildChunks   []*Chunk
 	//NeighborChunk *Chunk
+	Lock   *Lock
 	Index  int
 	Offset int64
 	Length int64
@@ -506,14 +511,14 @@ type Chunk struct {
 // that condition be  achunk that is the offset 0, length -1, and a single
 // chunk.
 type Read struct {
-	File   File
+	File   *File
 	Atomic bool // Use Locks
 	ReadAt time.Time
 	Chunks []Chunk
 	//Checksum Hash // Root of Merkle
 }
 
-func (self File) Read() *Read {
+func (self *File) Read() *Read {
 	return &Read{
 		File:   self,
 		Atomic: true,
@@ -527,131 +532,110 @@ func (self File) Read() *Read {
 	}
 }
 
-func (self *File) Chunk() *Read {
-	for i := 0; i < self.ChunkCount(); i++ {
-		self.Chunks = append(self.Chunks, &Read{
-			File:   self.File,
-			Offset: (i * self.ChunkSize),
+// TODO: Not a fan of this, should be using uint's to save memory
+func (self *File) ChunkedRead(chunkSize int64) *Read {
+	chunkCount := self.Size() / chunkSize
+	if (self.Size() % chunkSize) != 0 {
+		chunkCount += 1
+	}
+	var chunks = []Chunk{}
+	for index := int64(0); index < chunkCount; index++ {
+		chunks = append(chunks, Chunk{
+			Offset: (index * chunkSize),
+			Length: chunkSize,
 		})
 	}
-}
-
-func (self *Read) Chunked(size int64) *Read {
-	chunks := self.Size() / size
-	if (fileSize % chunkSize) != 0 {
-		chunks += 1
-	}
-}
-
-func (self File) ParallelRead(chunks int64) *Read {
-	fileSize := self.Size()
-	chunkSize := fileSize / chunks
-	if (fileSize % chunks) != 0 {
-		chunkSize += 1
-	}
-
 	return &Read{
 		File:   self,
 		Atomic: true,
+		ReadAt: time.Now(),
+		Chunks: chunks,
 	}
 }
 
-func (self *Read) FullRead() *Read {
-
+func (self *File) ParallelRead(chunkCount int64) *Read {
+	chunkSize := self.Size() / chunkCount
+	if (self.Size() % chunkCount) != 0 {
+		chunkSize += 1
+	}
+	var chunks = []Chunk{}
+	for index := int64(0); index < chunkCount; index++ {
+		chunks = append(chunks, Chunk{
+			Offset: (index * chunkSize),
+			Length: chunkSize,
+		})
+	}
+	return &Read{
+		File:   self,
+		Atomic: true,
+		Chunks: chunks,
+	}
 }
 
 func (self *Read) Path() Path { return self.File.Path() }
 
-func (self *Read) StartAt(offset int) *Read {
-	self.Offset = int64(offset)
-	return self
-}
+// TODO: In the future we use these to read each chunk in parallel using Go
+// function and piece them back together using io.Reader's multireader
+//func (self *Read) ReadSection() io.Reader {
+//	return io.NewSectionReader(self.File.ReadOnly(), self.Offset, self.Length)
+//}
 
-// Aliasing
-func (self *Read) Skip(offset int) *Read { return self.StartAt(offset) }
-
-func (self *Read) UseLock() *Read {
-	self.Lock = true
-	return self
-}
-
-func (self *Read) Limit(limit int) *Read {
-	self.Length = int64(limit)
-	return self
-}
-
-func (self *Read) Chunk(size int) *Read {
-	self.ChunkSize = int64(size)
-	return self
-}
-
-func (self *Read) ChunkCount() uint64 {
-	chunks := (self.File.Size() / self.Chunk)
-	if (self.File.Path().Size() % self.Chunk) != 0 {
-		return uint64(chunks + 1)
-	} else {
-		return uint64(chunks)
-	}
-}
-
-func (self *Read) ChunkOffset(chunkIndex int) int64 {
-	return int64(chunkIndex) * self.Chunk
-}
-
-func (self *Read) ReadSection() io.Reader {
-	return io.NewSectionReader(self.File.ReadOnly(), self.Offset, self.Length)
-}
-
-func (self *Read) ReadChunk(chunkIndex int) io.Reader {
-	return io.NewSectionReader(self.File.ReadOnly(), self.ChunkOffset(chunkIndex), self.Chunk)
-}
+//func (self *Read) ReadChunk(chunkIndex int) io.Reader {
+//	return io.NewSectionReader(self.File.ReadOnly(), self.ChunkOffset(chunkIndex), self.Chunk)
+//}
 
 func (self *Read) Bytes() []byte {
-	switch self.Type {
-	case Parallel:
-		// TODO: Currently does not attempt a parellel read
 
-	default:
-		return self.File.Bytes()
+	var chunks []io.Reader
+	for _, chunk := range self.Chunks {
+		chunks = append(chunks, io.NewSectionReader(self.File.ReadOnly(), chunk.Offset, chunk.Length))
 	}
+
+	data := io.MultiReader(chunks...)
+
+	bytes, err := ioutil.ReadAll(data)
 	if err != nil {
 		panic(err)
 	}
-	if readBytes != self.Limit {
-		panic(fmt.Errorf("error: failed to complete read: read ", readBytes, " out of ", self.Limit, "bytes"))
-	}
-	return data
+	return bytes
+
+	//buffer := bytes.NewBuffer([]byte{})
+	//size, err := io.Copy(buffer, data)
+	//if err != nil {
+	//	panic(err)
+	//}
+	//return buffer.Bytes()
+
 }
 
 func (self *Read) String() string { return string(self.Bytes()) }
 
 // WRITE //////////////////////////////////////////////////////////////////////
 type Write struct {
-	Type    IOType
+	File    *File
+	Atomic  bool // Use Locks
 	WriteAt time.Time
-	File    File
-	Chunk   int64
-	Offset  int64
-	Length  int64
+	Chunks  []Chunk
 }
 
-func (self File) Write(writeType WriteType) *Write {
+func (self *File) Write() *Write {
 	return &Write{
-		Type:   writeType,
-		File:   self,
-		Offset: 0,
+		File: self,
+		Chunks: []Chunk{
+			Chunk{
+				Offset: 0,
+				Length: self.Size(),
+			},
+		},
 	}
 }
 
-func (self *Write) Offset(offset int) *Write {
-	self.Offset = offset
-	return self
-}
-
-func (self *Write) Bytes(b []byte) error {
+func (self *Write) Bytes(data []byte) error {
 	file := self.File.WriteOnly()
-	bytesToWrite := len(b)
-	return ioutil.WriteFile(self.File.Path().String(), b, 0644)
+	_ = len(data)
+	err := ioutil.WriteFile(self.File.Path().String(), data, 0644)
+	file.Close()
+	return err
 }
 
 func (self *Write) String(s string) error {
@@ -672,90 +656,72 @@ func (self *Write) String(s string) error {
 // and having similar API to Read/Write IO
 
 type Lock struct {
-	Path    Path
-	Timeout time.Duration
-	Type    int
-	Offset  int64
-	Length  int64
-	Chunk   int64
+	Path Path
+	//File     *File
+	Type     int16
+	Timeout  time.Duration
+	Atomic   bool // Use Locks
+	LockedAt time.Time
+	Chunks   []Chunk
 }
 
-func (self *Lock) Chunks() int {
-	chunks := (self.File.Size() / self.Chunk)
-	if (self.File.Size() % self.Chunk) != 0 {
-		return (chunks + 1)
-	} else {
-		return chunks
+//func (self *Lock) Chunks() int {
+//	chunks := (self.File.Size() / self.Chunk.Length)
+//	if (self.File.Size() % self.Chunk) != 0 {
+//		return (chunks + 1)
+//	} else {
+//		return chunks
+//	}
+//}
+
+func (self *Lock) WriteLock(chunk Chunk) *Lock {
+	file := File(self.Path).ReadOnly()
+	self.Type = syscall.F_WRLCK
+	self.Chunks = append(self.Chunks, chunk)
+	err := file.Close()
+	if err != nil {
+		panic(err)
 	}
-}
-
-func (self *Lock) ChunkOffset(chunkIndex int) int {
-	return (self.Chunk * chunkIndex)
-}
-
-func (self File) WriteLock(lockType LockType) *Lock {
-	return &Lock{
-		Type:    syscall.F_WRLCK,
-		Path:    self.Path(),
-		Timeout: (12 * time.Second),
-		Offset:  0,
-		Length:  self.Size(),
-	}
-}
-
-func (self File) ReadLock(lockType LockType) *Lock {
-	return &Lock{
-		Type:    syscall.F_RDLCK,
-		Path:    self.Path(),
-		Timeout: (12 * time.Second),
-		Offset:  0,
-		Length:  self.Size(),
-	}
-}
-
-func (self *Lock) StartAt(offset int) *Lock {
-	self.Offset = offset
 	return self
 }
 
-func (self *Lock) Skip(offset int) *Lock {
-	return self.StartAt(offset)
-}
-
-func (self *Lock) Limit(limit int) *Lock {
-	self.Length = limit
+func (self *Lock) ReadLock(chunk Chunk) *Lock {
+	file := File(self.Path).ReadOnly()
+	self.Type = syscall.F_RDLCK
+	self.Chunks = append(self.Chunks, chunk)
+	err := file.Close()
+	if err != nil {
+		panic(err)
+	}
 	return self
 }
 
-func (self *Lock) ChunkSize(size int) *Lock {
-	self.Chunk = size
-	return self
-}
-
-func (self *Lock) Close() error {
-	err := syscall.FcntlFlock(self.File.Fd(), syscall.F_SETLK, syscall.Flock_t{
+func (self *Lock) Close(chunk Chunk) error {
+	file := File(self.Path).ReadOnly()
+	err := syscall.FcntlFlock(file.Fd(), syscall.F_SETLK, &syscall.Flock_t{
 		Type:   self.Type,
 		Whence: int16(os.SEEK_SET),
-		Start:  self.Offset,
-		Len:    self.Length,
+		Start:  chunk.Offset,
+		Len:    chunk.Length,
 	})
 	if err != nil {
 		panic(err)
 	}
-	return self.File.Close()
+	return file.Close()
 }
 
-func (self *Lock) Open() error {
-	err := syscall.FcntlFlock(self.File.Fd(), syscall.F_SETLK, syscall.Flock_t{
+func (self *Lock) Open(chunk Chunk) error {
+	file := File(self.Path).ReadOnly()
+	err := syscall.FcntlFlock(file.Fd(), syscall.F_SETLK, &syscall.Flock_t{
 		Type:   syscall.F_UNLCK,
 		Whence: int16(os.SEEK_SET),
-		Start:  self.Offset,
-		Len:    self.Length,
+		Start:  chunk.Offset,
+		Len:    chunk.Length,
 	})
 	if err != nil {
 		panic(err)
 	}
-	return self.File.Close()
+	return file.Close()
 }
 
 // Validation /////////////////////////////////////////////////////////////////
